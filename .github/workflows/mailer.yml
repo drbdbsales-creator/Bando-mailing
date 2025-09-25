@@ -33,6 +33,9 @@ jobs:
       - name: Create logs directory
         run: mkdir -p logs
 
+      - name: Create data directory
+        run: mkdir -p data
+
       - name: Run main script
         run: python -m src.main
         env:
