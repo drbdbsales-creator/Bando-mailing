@@ -44,42 +44,7 @@ RECEIVER_EMAILS = [  # 여러 명 추가 가능
 SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
 TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
-# Gates 뉴스 요약 직접 입력 (최신 6개)
-GATES_NEWS_LIST = [
-    {
-        "title": "GATES INDUSTRIAL TO PARTICIPATE IN THE JEFFERIES 2025 INDUSTRIALS CONFERENCE",
-        "summary": "Gates Industrial Corporation이 Jefferies 2025 산업 컨퍼런스에 참가합니다.",
-        "link": "https://www.gates.com/content/gates/us/en/about-us/news.one.122740.html"
-    },
-    {
-        "title": "GATES RELEASES 2024 CORPORATE SUSTAINABILITY REPORT",
-        "summary": "Gates는 지속가능성을 전략적 우선순위로 삼아 혁신과 신뢰, 장기적 성과를 강화하고 있습니다.",
-        "link": "https://www.gates.com/content/gates/us/en/about-us/news.one.122739.html"
-    },
-    {
-        "title": "GATES INDUSTRIAL REPORTS SECOND-QUARTER 2025 RESULTS",
-        "summary": "Gates Industrial Corporation이 2025년 2분기 실적을 발표했습니다.",
-        "link": "https://www.gates.com/content/gates/us/en/about-us/news.one.122738.html"
-    },
-    {
-        "title": "GATES CORPORATION IS A 2025 ENVIRONMENTAL INITIATIVE SEAL AWARD WINNER",
-        "summary": "Gates가 혁신적인 Chain-to-Belt 이니셔티브로 2025 SEAL 환경상 수상.",
-        "link": "https://www.gates.com/content/dam/documents-library/news/seal-award-gates-c2b-press-release.pdf"
-    },
-    {
-        "title": "MORE RACE TEAMS BET ON GATES BELT DRIVES FOR 2025 UCI DOWNHILL SEASON – €100K BELTED PURSE REMAINS UP FOR GRABS",
-        "summary": "Gates가 2025 UCI 다운힐 시즌을 위해 4개 레이스팀과 공식 파트너십을 체결.",
-        "link": "https://www.gates.com/content/dam/documents-library/news/press-release-mobility-downhill-jan2025.pdf"
-    },
-    {
-        "title": "GATES HOSTS ANNUAL BUILD-O-RAMA CHARITY BIKE GIVEAWAY",
-        "summary": "Gates가 연례 자선 자전거 증정 행사를 개최, 2018년부터 수백 대의 자전거를 기부.",
-        "link": "https://www.gates.com/content/dam/documents-library/news/build-o-rama-2024-press-release.pdf"
-    },
-]
-
-# 디버그용 원본 HTML 저장 경로 (BASE_DIR 아래 temp 폴더)
-SAVE_HTML_PATH = os.path.join(BASE_DIR, "temp", "bando_news.html")
+SAVE_HTML_PATH = os.path.join(BASE_DIR, "temp", "bando_news.html")  # 디버그용 원본 HTML 저장
 BASE_HOST = "https://www.bandogrp.com"
 # ================================================
 
@@ -245,89 +210,23 @@ def create_email_body(articles):
 
 def send_email(creds, articles):
     """Gmail API로 HTML 메일 발송 (여러 수신자 지원, Gates+Bando)"""
-    def translate_text(text, src='en', dest='ko'):
-        if Translator is None:
-            return text + " (번역 라이브러리 미설치)"
-        try:
-            translator = Translator()
-            result = translator.translate(text, src=src, dest=dest)
-            return result.text
-        except Exception as e:
-            return text + f" (번역 오류: {e})"
-
-    def get_gates_news():
-        news = []
-        for item in GATES_NEWS_LIST:
-            title = item["title"]
-            summary_en = item["summary"]
-            link = item["link"]
-            summary_ko = translate_text(summary_en)
-            news.append({
-                "title": title,
-                "summary_en": summary_en,
-                "summary_ko": summary_ko,
-                "link": link
-            })
-        return news
-
-    def create_gates_email_body(news):
-        if not news:
-            return "<h1>Gates News</h1><p>최근 뉴스가 없습니다.</p>"
-        rows = []
-        for n in news:
-            title = html.escape(n["title"])
-            link = n["link"]
-            summary_en = html.escape(n["summary_en"])
-            summary_ko = html.escape(n["summary_ko"])
-            title_cell = f"<a href='{link}'>{title}</a>"
-            rows.append(
-                f"<tr>"
-                f"<td style='padding:6px 10px;'>{title_cell}</td>"
-                f"<td style='padding:6px 10px;'>{summary_en}</td>"
-                f"<td style='padding:6px 10px;'>{summary_ko}</td>"
-                f"<td style='padding:6px 10px;'><a href='{link}'>{link}</a></td>"
-                f"</tr>"
-            )
-        table = (
-            "<h1>Gates News (최신 6건)</h1>"
-            "<table border='1' cellspacing='0' cellpadding='0' "
-            "style='border-collapse:collapse; font-family:Arial,Helvetica,sans-serif; font-size:14px;'>"
-            "<thead>"
-            "<tr style='background:#f2f2f2;'>"
-            "<th style='padding:8px 10px;'>Title</th>"
-            "<th style='padding:8px 10px;'>Summary(EN)</th>"
-            "<th style='padding:8px 10px;'>Summary(KO)</th>"
-            "<th style='padding:8px 10px;'>Link</th>"
-            "</tr>"
-            "</thead>"
-            "<tbody>"
-            + "".join(rows) +
-            "</tbody>"
-            "</table>"
-        )
-        return table
-
     try:
         service = build("gmail", "v1", credentials=creds)
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         bando_html = create_email_body(articles)
-        gates_news = get_gates_news()
-        gates_html = create_gates_email_body(gates_news)
         body = (
             f"<h2>[자동화] 월간 뉴스 리포트 ({today_str})</h2>"
-            f"<hr>"
-            f"{gates_html}"
             f"<hr>"
             f"{bando_html}"
         )
         msg = MIMEText(body, "html", _charset="utf-8")
-        msg["Subject"] = f"[자동화] Gates+Bando 월간 뉴스 리포트 ({today_str})"
+        msg["Subject"] = f"[자동화] Bando 월간 뉴스 리포트 ({today_str})"
         msg["From"] = SENDER_EMAIL
         msg["To"] = ", ".join(RECEIVER_EMAILS)
 
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         service.users().messages().send(userId="me", body={"raw": raw}).execute()
-        print(f"[INFO] 이메일 발송 완료: Gates {len(gates_news)}건, Bando {len(articles)}건, 수신자: {msg['To']}")
+        print(f"[INFO] 이메일 발송 완료: Bando {len(articles)}건, 수신자: {msg['To']}")
     except HttpError as e:
         print(f"[ERROR] 이메일 전송 오류: {e}")
 
