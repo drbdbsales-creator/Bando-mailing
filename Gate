@@ -1,0 +1,569 @@
+"""
+이 스크립트는 Gates 뉴스/보도자료 페이지를 크롤링해 요약 후 이메일로 전송합니다.
+- 사이트 구조 변경을 대비해 소스를 2곳으로 이원화:
+  1) https://www.gates.com/news.html (브랜드/회사 뉴스)
+  2) https://investors.gates.com/news/default.aspx (IR/보도자료)
+- 다중 수신자, SMTP 방어로직, 테스트메일 옵션(--test-email) 포함
+- robots.txt 및 이용약관을 반드시 확인하세요. 과도한 요청 금지.
+- .env 예시:
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=587
+    SMTP_USER=drbd2022006@gmail.com
+    SMTP_PASS=앱비밀번호(16자리)   # Gmail은 2단계 인증 후 앱 비밀번호 사용
+    SMTP_TLS=true
+    FROM_ADDR=drbd2022006@gmail.com
+    TO_ADDRS=jung.jae.hun@drbworld.com,kim.jeong.yun@drbworld.com
+    GEMINI_API_KEY=...            # 번역 사용 시
+"""
+import os
+import sys
+import argparse
+import logging
+import datetime
+import time
+import json
+import requests
+from bs4 import BeautifulSoup
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import List, Dict, Optional, Set
+
+# =========================
+# 환경설정 / 경로
+# =========================
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BASE_DIR, "data")
+LOG_DIR = os.path.join(BASE_DIR, "..", "logs")
+OUT_DIR = os.path.join(BASE_DIR, "..", "out")
+for d in (DATA_DIR, LOG_DIR, OUT_DIR):
+    os.makedirs(d, exist_ok=True)
+
+SEEN_PATH = os.path.join(DATA_DIR, "news_seen.json")
+LOG_PATH = os.path.join(LOG_DIR, "app.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger("gates_news")
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; GatesNewsBot/1.0)"}
+
+# =========================
+# 번역 (Gemini API)
+# =========================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+def translate_en_to_ko(text: str) -> Optional[str]:
+    if not text:
+        return ""
+    if not GEMINI_API_KEY:
+        logger.info("GEMINI_API_KEY not set. Skipping translation.")
+        return ""
+    try:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": f"Translate to Korean (60~120자): {text}"}]}],
+            "generationConfig": {"temperature": 0.7},
+        }
+        resp = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+        ko = result["candidates"][0]["content"]["parts"][0]["text"]
+        return ko.strip()
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+        return ""
+
+# =========================
+# 뉴스 중복 관리
+# =========================
+def load_seen_urls() -> Set[str]:
+    if not os.path.exists(SEEN_PATH):
+        return set()
+    try:
+        with open(SEEN_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data)
+    except Exception as e:
+        logger.error(f"Failed to load seen URLs: {e}")
+        return set()
+
+def save_seen_urls(urls: Set[str]):
+    try:
+        with open(SEEN_PATH, "w", encoding="utf-8") as f:
+            json.dump(list(urls), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save seen URLs: {e}")
+
+# =========================
+# 소스별 크롤러
+# =========================
+def fetch_html_from_gates_com() -> List[Dict]:
+    """
+    gates.com/news.html 페이지에서 뉴스 카드 추출
+    """
+    url = "https://www.gates.com/news.html"
+    resp = requests.get(url, headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+
+    # 디버그용 원본 저장
+    debug_path = os.path.join(LOG_DIR, "gates_com_news_debug.html")
+    with open(debug_path, "w", encoding="utf-8") as f:
+        f.write(resp.text)
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    items: List[Dict] = []
+
+    # 링크 중 '/news/'를 포함하는 카드성 a 태그를 수집
+    for a in soup.select("a[href*='/news/']"):
+        href = a.get("href", "")
+        title = a.get_text(" ", strip=True)
+        if not href or "/news/" not in href or not title:
+            continue
+
+        full_url = href if href.startswith("http") else "https://www.gates.com" + href
+
+        # 주변에서 요약 텍스트 추정 (p 태그 우선)
+        summary = ""
+        parent = a.find_parent()
+        if parent:
+            p = parent.find("p")
+            if p:
+                summary = p.get_text(" ", strip=True)
+
+        items.append({
+            "title": title,
+            "url": full_url,
+            "summary": summary,
+            "source": "gates.com",
+        })
+
+    return items
+
+def fetch_html_from_ir() -> List[Dict]:
+    """
+    investors.gates.com IR 보도자료 리스트에서 항목 추출
+    """
+    url = "https://investors.gates.com/news/default.aspx"
+    resp = requests.get(url, headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+
+    # 디버그용 원본 저장
+    debug_path = os.path.join(LOG_DIR, "gates_ir_news_debug.html")
+    with open(debug_path, "w", encoding="utf-8") as f:
+        f.write(resp.text)
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    items: List[Dict] = []
+
+    # 보도자료 상세로 이어지는 링크 패턴
+    for a in soup.select("a[href*='/news/press-release-details/']"):
+        href = a.get("href", "")
+        title = a.get_text(" ", strip=True)
+        if not href or not title:
+            continue
+        full_url = href if href.startswith("http") else "https://investors.gates.com" + href
+
+        # 날짜 등 인접 텍스트(상위 요소)에서 간단 요약 추출
+        date_text = ""
+        date_el = a.find_previous(["span", "time", "div"])
+        if date_el:
+            date_text = date_el.get_text(" ", strip=True)
+
+        items.append({
+            "title": title,
+            "url": full_url,
+            "summary": date_text,
+            "source": "investors",
+        })
+    return items
+
+def fetch_news() -> List[Dict]:
+    items: List[Dict] = []
+    try:
+        items.extend(fetch_html_from_gates_com())
+    except Exception as e:
+        logger.error(f"gates.com fetch error: {e}")
+    try:
+        items.extend(fetch_html_from_ir())
+    except Exception as e:
+        logger.error(f"IR fetch error: {e}")
+
+    # 중복 제거(동일 URL)
+    seen_urls = set()
+    deduped: List[Dict] = []
+    for it in items:
+        if it["url"] in seen_urls:
+            continue
+        seen_urls.add(it["url"])
+        deduped.append(it)
+
+    if not deduped:
+        logger.warning("Fetched 0 items. Likely selector or URL changed.")
+    return deduped
+
+# =========================
+# 파싱/요약
+# =========================
+def parse_item(item: Dict) -> Dict:
+    title = item.get("title", "").strip()
+    url = item.get("url", "").strip()
+    summary_en = (item.get("summary", "") or "").strip()
+
+    # 길이 컷(영문 25~40 단어 내)
+    words = summary_en.split()
+    if len(words) > 40:
+        summary_en = " ".join(words[:40]) + "..."
+    # 25단어 미만은 그대로 허용
+
+    return {
+        "title": title,
+        "url": url,
+        "summary_en": summary_en,
+    }
+
+# =========================
+# 이메일 전송
+# =========================
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_TLS = os.getenv("SMTP_TLS", "true").lower() == "true"
+FROM_ADDR = os.getenv("FROM_ADDR") or os.getenv("SMTP_USER") or "no-reply@example.com"
+TO_ADDRS = os.getenv("TO_ADDRS", "jung.jae.hun@drbworld.com").split(",")
+
+def send_news_email(news_items: List[Dict], date_str: str):
+    # SMTP 환경 체크
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        logger.error("SMTP env missing. Check SMTP_HOST/SMTP_USER/SMTP_PASS.")
+        return
+
+    subject = f"[Gates News] 새 소식 {len(news_items)}건 ({date_str})"
+    html = (
+        "<h3>Gates News</h3>"
+        "<table border='1' cellspacing='0' cellpadding='6'>"
+        "<tr><th align='left'>Title</th><th align='left'>Summary(EN)</th>"
+        "<th align='left'>Summary(KO)</th><th align='left'>URL</th></tr>"
+    )
+    for item in news_items:
+        html += (
+            f"<tr>"
+            f"<td>{item['title']}</td>"
+            f"<td>{item.get('summary_en','')}</td>"
+            f"<td>{item.get('summary_ko','')}</td>"
+            f"<td><a href='{item['url']}'>{item['url']}</a></td>"
+            f"</tr>"
+        )
+    html += "</table>"
+
+    msg = MIMEMultipart()
+    msg["From"] = FROM_ADDR
+    msg["To"] = ", ".join([addr.strip() for addr in TO_ADDRS if addr.strip()])
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        if SMTP_TLS:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(FROM_ADDR, TO_ADDRS, msg.as_string())
+        else:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(FROM_ADDR, TO_ADDRS, msg.as_string())
+        logger.info(f"Email sent: {subject} -> {TO_ADDRS}")
+    except Exception as e:
+        logger.error(
+            f"Email send error (host={SMTP_HOST}, port={SMTP_PORT}, tls={SMTP_TLS}): {e}"
+        )
+
+# =========================
+# 메인
+# =========================
+def main():
+    parser = argparse.ArgumentParser(description="Gates News Crawler")
+    parser.add_argument("--once", action="store_true", help="한 번만 실행(미사용 옵션, 호환용)")
+    parser.add_argument("--since", type=int, default=7, help="며칠 이내 뉴스만(알림용, 하위 로직에서 활용 제한적)")
+    parser.add_argument("--max", type=int, default=20, help="최대 뉴스 건수")
+    parser.add_argument("--lang", choices=["ko", "en"], default="ko", help="요약 언어")
+    parser.add_argument("--test-email", action="store_true", help="SMTP 테스트 메일만 전송")
+    args = parser.parse_args()
+
+    today = datetime.date.today()
+    date_str = today.strftime("%Y-%m-%d")
+    today_tag = today.strftime("%Y%m%d")
+
+    if args.test_email:
+        # SMTP만 점검
+        send_news_email(
+            [{"title": "SMTP TEST", "summary_en": "Test body", "summary_ko": "테스트 본문", "url": "https://www.gates.com"}],
+            date_str,
+        )
+        return
+
+    news_items = fetch_news()
+    if not news_items:
+        logger.info("No items fetched from sources.")
+        return
+
+    seen = load_seen_urls()
+    new_items: List[Dict] = []
+
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=args.since)  # 참고값(일부 소스는 날짜 파싱 불가)
+
+    for item in news_items:
+        url = item.get("url", "")
+        if not url or url in seen:
+            continue
+
+        parsed = parse_item(item)
+
+        if args.lang == "ko":
+            ko = translate_en_to_ko(parsed.get("summary_en", ""))
+            parsed["summary_ko"] = ko
+        else:
+            parsed["summary_ko"] = ""
+
+        new_items.append(parsed)
+        seen.add(url)
+        if len(new_items) >= args.max:
+            break
+
+    save_seen_urls(seen)
+
+    if new_items:
+        send_news_email(new_items, date_str)
+        # CSV 저장
+        out_path = os.path.join(OUT_DIR, f"gates_news_{today_tag}.csv")
+        import csv
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["title", "summary_en", "summary_ko", "url"])
+            writer.writeheader()
+            for row in new_items:
+                writer.writerow(row)
+        logger.info(f"Saved {len(new_items)} news to {out_path}")
+    else:
+        logger.info("No new news found.")
+
+if __name__ == "__main__":
+    main()
+"""
+이 스크립트는 gates.com 뉴스 페이지를 크롤링합니다. robots.txt 및 이용약관을 반드시 확인하세요. 과도한 요청은 금지됩니다.
+"""
+import os
+import sys
+import argparse
+import logging
+import datetime
+import time
+import json
+import requests
+from bs4 import BeautifulSoup
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import List, Dict, Optional, Set
+
+# 환경설정
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+NEWS_URL = "https://www.gates.com/us/en/about-us/news.html"
+RSS_URL = None  # RSS 피드가 있으면 입력
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; GatesNewsBot/1.0)"}
+SEEN_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "news_seen.json")
+LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "logs", "app.log")
+OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "out")
+if not os.path.exists(OUT_DIR):
+    os.makedirs(OUT_DIR)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("gates_news")
+
+# 번역 (Gemini API)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+def translate_en_to_ko(text: str) -> Optional[str]:
+    if not GEMINI_API_KEY:
+        logger.info("GEMINI_API_KEY not set. Skipping translation.")
+        return ""
+    try:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": f"Translate to Korean (60~120자): {text}"}]}],
+            "generationConfig": {"temperature": 0.7}
+        }
+        resp = requests.post(f"{url}?key={GEMINI_API_KEY}", json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()
+        ko = result["candidates"][0]["content"]["parts"][0]["text"]
+        return ko.strip()
+    except Exception as e:
+        logger.error(f"Translation error: {e}")
+        return ""
+
+# 뉴스 중복 관리
+def load_seen_urls() -> Set[str]:
+    if not os.path.exists(SEEN_PATH):
+        return set()
+    try:
+        with open(SEEN_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data)
+    except Exception as e:
+        logger.error(f"Failed to load seen URLs: {e}")
+        return set()
+
+def save_seen_urls(urls: Set[str]):
+    try:
+        with open(SEEN_PATH, "w", encoding="utf-8") as f:
+            json.dump(list(urls), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save seen URLs: {e}")
+
+# 뉴스 가져오기
+def fetch_html() -> List[Dict]:
+    for attempt in range(3):
+        try:
+            resp = requests.get(NEWS_URL, headers=HEADERS, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            items = []
+            for article in soup.select(".news-listing .news-item"):
+                title = article.select_one(".news-title").get_text(strip=True)
+                url = article.select_one("a")['href']
+                if not url.startswith("http"):
+                    url = "https://www.gates.com" + url
+                summary = article.select_one(".news-summary")
+                summary = summary.get_text(strip=True) if summary else ""
+                items.append({
+                    "title": title,
+                    "url": url,
+                    "summary": summary
+                })
+            return items
+        except Exception as e:
+            logger.error(f"HTML fetch error (attempt {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+    return []
+
+def fetch_news() -> List[Dict]:
+    # RSS가 있으면 feedparser로 구현 가능
+    return fetch_html()
+
+# 뉴스 파싱
+def parse_item(item: Dict) -> Dict:
+    title = item.get("title", "")
+    url = item.get("url", "")
+    summary_en = item.get("summary", "")
+    words = summary_en.split()
+    if len(words) > 40:
+        summary_en = " ".join(words[:40]) + "..."
+    elif len(words) < 25:
+        summary_en = summary_en
+    return {
+        "title": title,
+        "url": url,
+        "summary_en": summary_en
+    }
+
+# 이메일 발송
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_TLS = os.getenv("SMTP_TLS", "true").lower() == "true"
+FROM_ADDR = "drbd2022006@gmail.com"
+TO_ADDR = "jung.jae.hun@drbworld.com"
+
+def send_news_email(news_items: List[Dict], date_str: str):
+    subject = f"[Gates News] 새 소식 {len(news_items)}건 ({date_str})"
+    html = "<h3>Gates News</h3><table border='1'><tr><th>Title</th><th>Summary(EN)</th><th>Summary(KO)</th><th>URL</th></tr>"
+    for item in news_items:
+        html += f"<tr><td>{item['title']}</td><td>{item['summary_en']}</td><td>{item.get('summary_ko','')}</td><td><a href='{item['url']}'>{item['url']}</a></td></tr>"
+    html += "</table>"
+    msg = MIMEMultipart()
+    msg['From'] = FROM_ADDR
+    msg['To'] = TO_ADDR
+    msg['Subject'] = subject
+    msg.attach(MIMEText(html, 'html'))
+    try:
+        if SMTP_TLS:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+            server.starttls()
+        else:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(FROM_ADDR, TO_ADDR, msg.as_string())
+        server.quit()
+        logger.info(f"Email sent: {subject}")
+    except Exception as e:
+        logger.error(f"Email send error: {e}")
+
+# 메인
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Gates News Crawler")
+    parser.add_argument("--once", action="store_true", help="한 번만 실행")
+    parser.add_argument("--since", type=int, default=7, help="며칠 이내 뉴스만")
+    parser.add_argument("--max", type=int, default=20, help="최대 뉴스 건수")
+    parser.add_argument("--lang", choices=["ko", "en"], default="ko", help="요약 언어")
+    args = parser.parse_args()
+
+    news_items = fetch_news()
+    seen = load_seen_urls()
+    new_items = []
+    today = datetime.date.today().strftime("%Y%m%d")
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=args.since)
+    for item in news_items:
+        if item["url"] in seen:
+            continue
+        parsed = parse_item(item)
+        if args.lang == "ko":
+            ko = translate_en_to_ko(parsed["summary_en"])
+            parsed["summary_ko"] = ko
+        else:
+            parsed["summary_ko"] = ""
+        new_items.append(parsed)
+        seen.add(item["url"])
+        if len(new_items) >= args.max:
+            break
+    save_seen_urls(seen)
+    if new_items:
+        send_news_email(new_items, datetime.date.today().strftime("%Y-%m-%d"))
+        out_path = os.path.join(OUT_DIR, f"gates_news_{today}.csv")
+        import csv
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["title", "summary_en", "summary_ko", "url"])
+            writer.writeheader()
+            for row in new_items:
+                writer.writerow(row)
+        logger.info(f"Saved {len(new_items)} news to {out_path}")
+    else:
+        logger.info("No new news found.")
