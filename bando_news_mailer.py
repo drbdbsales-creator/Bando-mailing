@@ -32,7 +32,8 @@ from googleapiclient.errors import HttpError
 
 # =====================[ 설정 ]=====================
 URL = "https://www.bandogrp.com/eng/news/index.html"
-BASE_DIR = r"c:\Users\jung.jae.hun\Documents\AI agent\Market sensing"
+# 스크립트 파일의 실제 위치를 기준으로 BASE_DIR 설정
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SENDER_EMAIL = "drbd2022006@gmail.com"
 RECEIVER_EMAILS = [  # 여러 명 추가 가능
@@ -77,7 +78,8 @@ GATES_NEWS_LIST = [
     },
 ]
 
-SAVE_HTML_PATH = r"c:\temp\bando_news.html"  # 디버그용 원본 HTML 저장
+# 디버그용 원본 HTML 저장 경로 (BASE_DIR 아래 temp 폴더)
+SAVE_HTML_PATH = os.path.join(BASE_DIR, "temp", "bando_news.html")
 BASE_HOST = "https://www.bandogrp.com"
 # ================================================
 
