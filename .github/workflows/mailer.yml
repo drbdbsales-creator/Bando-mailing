@@ -30,6 +30,9 @@ jobs:
       - name: Create token.json
         run: echo '${{ secrets.TOKEN_JSON }}' > src/token.json
 
+      - name: Create logs directory
+        run: mkdir -p logs
+
       - name: Run main script
         run: python -m src.main
         env:
