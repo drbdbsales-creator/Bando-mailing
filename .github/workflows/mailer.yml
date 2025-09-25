@@ -31,4 +31,6 @@ jobs:
         run: echo '${{ secrets.TOKEN_JSON }}' > src/token.json
 
       - name: Run main script
-        run: python src/main.py
+        run: python -m src.main
+        env:
+          PYTHONPATH: ${{ github.workspace }}
